@@ -11,6 +11,7 @@ from sklearn.preprocessing import StandardScaler
 import joblib
 from deepface import DeepFace
 from typing import Tuple, Optional, Dict, List
+from tqdm import tqdm
 
 # --- Correct imports for moviepy 2.x ---
 from moviepy.editor import (
