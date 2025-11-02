@@ -1,0 +1,40 @@
+# Web framework
+fastapi==0.115.0
+uvicorn[standard]==0.30.1
+python-multipart==0.0.9
+
+# Video and scene analysis
+scenedetect[opencv]==0.6.3
+moviepy==1.0.3
+opencv-python==4.10.0.84
+decord==0.6.0
+
+# Core numerical and ML libraries
+numpy==1.24.4
+pandas==2.1.4
+scikit-learn==1.4.2
+joblib==1.4.2
+
+# Deep learning frameworks
+tensorflow==2.15.0
+keras==2.15.0
+tf-keras==2.16.0  # Ensures DeepFace works smoothly with TF 2.15+
+torch==2.9.0+cpu
+torchvision==0.20.0+cpu
+torchaudio==2.9.0+cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# Face detection and recognition
+deepface==0.0.93
+mtcnn==0.1.1
+retina-face==0.0.15
+
+# Transformers for embeddings or vision-language tasks
+transformers==4.43.3
+
+# Utilities and progress tracking
+tqdm==4.66.2
+requests==2.32.3
+Pillow==10.4.0
+matplotlib==3.8.4
+gdown==5.1.0
