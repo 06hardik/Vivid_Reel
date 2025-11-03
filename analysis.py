@@ -6,14 +6,12 @@ from scenedetect.video_splitter import split_video_ffmpeg
 import cv2
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
 import joblib
 from deepface import DeepFace
 from typing import Tuple, Optional, Dict, List
 from tqdm import tqdm
 
-# --- Correct imports for moviepy 2.x ---
+# --- Correct imports for moviepy 1.0.3 ---
 from moviepy.editor import (
     VideoFileClip,
     concatenate_videoclips,
@@ -37,6 +35,9 @@ RF_SCALER_PATH = 'models/scaler.pkl'            # Your RandomForest scaler
 HAAR_CASCADE_PATH = 'haarcascade_frontalface_default.xml'
 MIN_CONFIDENCE_THRESHOLD = 0.50 # (50%)
 # ---------------------------
+
+# Set decord bridge
+decord.bridge.set_bridge('torch')
 
 # --- Helper functions for CV2-based filters ---
 def _boost_saturation(frame, factor=1.2):
@@ -100,67 +101,82 @@ def split_videos_into_scenes(session_path: str) -> list:
     print(f"Total scenes created: {len(all_scene_files)}")
     return all_scene_files
 
-# --- Feature Extraction Helpers (Used by BOTH models) ---
+# --- Feature Extraction Helpers (Used by RF & Heuristics) ---
 
-def _calculate_focus_score(frame) -> float:
-    if frame is None:
-        return 0
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+def _calculate_focus_score(frame, is_rgb=True) -> float:
+    """Calculates focus score (Laplacian variance)."""
+    if frame is None: return 0
+    if is_rgb:
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+    else: # Assumes BGR
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     return cv2.Laplacian(gray, cv2.CV_64F).var()
 
-def _calculate_motion_score(frame1, frame2) -> float:
-    if frame1 is None or frame2 is None:
-        return 0
-    gray1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
-    gray2 = cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY)
+def _calculate_motion_score(frame1, frame2, is_rgb=True) -> float:
+    """Calculates motion score between two frames."""
+    if frame1 is None or frame2 is None: return 0
+    if is_rgb:
+        gray1 = cv2.cvtColor(frame1, cv2.COLOR_RGB2GRAY)
+        gray2 = cv2.cvtColor(frame2, cv2.COLOR_RGB2GRAY)
+    else: # Assumes BGR
+        gray1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
+        gray2 = cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY)
     diff = cv2.absdiff(gray1, gray2)
     _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
-    motion_pct = np.mean(thresh)
-    return motion_pct
+    return np.mean(thresh)
 
-def analyze_emotions_from_frame(frame):
+def analyze_emotions_from_frame(frame, is_rgb=True):
+    """Analyzes an RGB or BGR frame for emotion."""
     try:
+        frame_to_analyze = frame
+        if is_rgb:
+            frame_to_analyze = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        
         analysis = DeepFace.analyze(
-            frame, 
+            frame_to_analyze, # Pass BGR frame
             actions=['emotion'], 
             enforce_detection=False,
             detector_backend='opencv',
             silent=True
         )
-        dominant_emotion = analysis[0]['dominant_emotion']
-        return True, dominant_emotion
+        return analysis[0]['dominant_emotion']
     except Exception as e:
-        return False, 'none'
+        return 'none'
+
+def get_frames(full_path: str) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Loads first, middle, and last frame (as RGB) from an MP4 file using decord."""
+    try:
+        vr = decord.VideoReader(full_path, ctx=decord.cpu(0))
+        total_frames = len(vr)
+        if total_frames < 2: return None
+        
+        first_frame = vr.get_batch([0]).asnumpy()[0]
+        middle_frame = vr.get_batch([total_frames // 2]).asnumpy()[0]
+        last_frame = vr.get_batch([total_frames - 1]).asnumpy()[0]
+        
+        return first_frame, middle_frame, last_frame
+    except Exception as e:
+        return None
 
 def get_scene_features_for_rf(scene_file: str, face_cascade) -> Optional[np.ndarray]:
     """Extracts the 11-feature vector for the RandomForest model."""
-    cap = None
+    frames = get_frames(scene_file)
+    if frames is None:
+        return None
+        
+    first_frame, middle_frame, last_frame = frames
+    
     try:
-        cap = cv2.VideoCapture(scene_file)
-        if not cap.isOpened(): return None
-        ret, first_frame = cap.read()
-        if not ret: return None
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if total_frames < 2: return None
-        middle_frame_index = total_frames // 2
-        cap.set(cv2.CAP_PROP_POS_FRAMES, middle_frame_index)
-        ret, middle_frame = cap.read()
-        if not ret: middle_frame = first_frame
-        last_frame_index = max(0, total_frames - 2)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, last_frame_index)
-        ret, last_frame = cap.read()
-        if not ret: last_frame = first_frame
-
-        focus_score = _calculate_focus_score(middle_frame)
-        motion_score = _calculate_motion_score(first_frame, last_frame)
+        focus_score = _calculate_focus_score(middle_frame, is_rgb=True)
+        motion_score = _calculate_motion_score(first_frame, last_frame, is_rgb=True)
         
         num_faces = 0
         if middle_frame is not None:
-            gray_middle = cv2.cvtColor(middle_frame, cv2.COLOR_BGR2GRAY)
+            gray_middle = cv2.cvtColor(middle_frame, cv2.COLOR_RGB2GRAY)
             faces = face_cascade.detectMultiScale(gray_middle, 1.1, 5, minSize=(30, 30))
             num_faces = len(faces)
         
-        has_emotion, dominant_emotion = analyze_emotions_from_frame(middle_frame)
+        dominant_emotion = analyze_emotions_from_frame(middle_frame, is_rgb=True)
 
         features = [
             focus_score,
@@ -178,11 +194,7 @@ def get_scene_features_for_rf(scene_file: str, face_cascade) -> Optional[np.ndar
         return np.array(features)
 
     except Exception as e:
-        print(f"Error extracting features for {scene_file}: {e}")
         return None
-    finally:
-        if cap:
-            cap.release()
 
 # --- MODEL 1: VideoMAE Prediction Function ---
 def predict_scene_scores_transformer(all_scene_files: list) -> dict:
@@ -198,13 +210,8 @@ def predict_scene_scores_transformer(all_scene_files: list) -> dict:
     model.eval()
     print(f"VideoMAE model loaded and on device: {device}")
 
-    # --- Define "Good" Action IDs ---
-    # This must match the classes you trained on (from videodataset.py / 2_generate_labels_csv.py)
-    # Check your 'test_loader.py' output for the 'Class mapping'
-    # EXAMPLE: {'cheering_or_clapping': 0, 'dancing': 1, 'hugging_or_emotional': 2, 'other': 3, ...}
-    
     # !!! IMPORTANT: YOU MUST UPDATE THESE NUMBERS TO MATCH YOUR LABELS !!!
-    GOOD_ACTION_IDS = [0, 1, 2, 3, 4, 5, 6] # Assumes 0-6 are your "good" actions and 7 is 'other'
+    GOOD_ACTION_IDS = [0, 1, 2, 3, 4, 5, 6] # Assumes 0-6 are 'good' and 7 is 'other'
     
     scored_scenes = {}
     print(f"Analyzing {len(all_scene_files)} scenes with VideoMAE...")
@@ -215,8 +222,10 @@ def predict_scene_scores_transformer(all_scene_files: list) -> dict:
             total_frames = len(vr)
             if total_frames < 16: continue
             indices = np.linspace(0, total_frames - 1, num=16, dtype=int)
-            frames = vr.get_batch(indices)
-            frames_list = [frame.numpy() for frame in frames]
+            
+            frames_tensor = vr.get_batch(indices) 
+            frames_numpy = frames_tensor.numpy() 
+            frames_list = [frame for frame in frames_numpy]
 
             inputs = feature_extractor(frames_list, return_tensors="pt").to(device)
             transformer_score = 0.0
@@ -236,18 +245,14 @@ def predict_scene_scores_transformer(all_scene_files: list) -> dict:
                 scored_scenes[scene_file] = 0.0
         
         except Exception as e:
-            print(f"Error analyzing scene {scene_file}: {e}")
+            print(f"Analysis Complete")
             scored_scenes[scene_file] = 0.0
             
-    print(f"VideoMAE analysis complete.")
+    print(f"VideoMAE analysis complete. Switching to Random Forest...")
     return scored_scenes
 
 # --- MODEL 2: RandomForest Prediction Function (Fallback) ---
 def predict_scene_scores_randomforest(all_scene_files: list) -> dict:
-    """
-    Analyzes scenes using the PRE-TRAINED RandomForest MODEL to get scores.
-    This is the fallback model.
-    """
     print(f"Loading RandomForest model from {RF_MODEL_PATH}...")
     try:
         model = joblib.load(RF_MODEL_PATH)
@@ -265,7 +270,11 @@ def predict_scene_scores_randomforest(all_scene_files: list) -> dict:
         features = get_scene_features_for_rf(scene_file, face_cascade)
         if features is not None:
             scaled_features = scaler.transform([features])
-            probability_score = model.predict_proba(scaled_features)[0][1] # Assumes 1 is "good"
+            all_probs = model.predict_proba(scaled_features)[0]
+            
+            other_class_id = len(model.classes_) - 1 
+            probability_score = 1.0 - all_probs[other_class_id]
+            
             if probability_score >= MIN_CONFIDENCE_THRESHOLD:
                 scored_scenes[scene_file] = probability_score
             else:
@@ -273,7 +282,77 @@ def predict_scene_scores_randomforest(all_scene_files: list) -> dict:
         else:
             scored_scenes[scene_file] = 0.0
             
-    print(f"RandomForest analysis complete.")
+    print(f"RandomForest analysis complete. Switching to Heuristic Analysis...")
+    return scored_scenes
+
+
+# --- MODEL 3: Smart Heuristics (Safest Fallback) ---
+def predict_scene_scores_heuristics(all_scene_files: list) -> dict:
+    print(f"Loading face detection model from {HAAR_CASCADE_PATH}...")
+    if not os.path.exists(HAAR_CASCADE_PATH):
+        raise FileNotFoundError(f"Face detection model not found: {HAAR_CASCADE_PATH}")
+    face_cascade = cv2.CascadeClassifier(HAAR_CASCADE_PATH)
+
+    FOCUS_THRESHOLD = 100.0 
+    MOTION_THRESHOLD = 1.0  
+    FACE_BONUS = 100.0      
+    
+    scored_scenes = {}
+    print(f"Analyzing {len(all_scene_files)} with Smart Heuristics...")
+    
+    for scene_file in tqdm(all_scene_files, desc="Scoring Scenes (Heuristics)"):
+        cap = None
+        try:
+            cap = cv2.VideoCapture(scene_file)
+            if not cap.isOpened():
+                scored_scenes[scene_file] = 0.0
+                continue
+
+            ret, first_frame = cap.read() # BGR frame
+            if not ret: continue
+
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total_frames < 2: continue
+                
+            middle_frame_index = total_frames // 2
+            cap.set(cv2.CAP_PROP_POS_FRAMES, middle_frame_index)
+            ret, middle_frame = cap.read() # BGR frame
+            if not ret: middle_frame = first_frame
+
+            last_frame_index = max(0, total_frames - 2)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, last_frame_index)
+            ret, last_frame = cap.read() # BGR frame
+            if not ret: last_frame = first_frame
+
+            focus_score = _calculate_focus_score(middle_frame, is_rgb=False)
+            motion_score = _calculate_motion_score(first_frame, last_frame, is_rgb=False)
+            
+            if focus_score < FOCUS_THRESHOLD or motion_score < MOTION_THRESHOLD:
+                scored_scenes[scene_file] = 0.0 
+                continue
+            
+            priority_score = 100.0 
+            
+            num_faces = 0
+            if middle_frame is not None:
+                gray_middle = cv2.cvtColor(middle_frame, cv2.COLOR_BGR2GRAY)
+                faces = face_cascade.detectMultiScale(gray_middle, 1.1, 5, minSize=(30, 30))
+                num_faces = len(faces)
+                priority_score += (num_faces * FACE_BONUS)
+            
+            # NOTE: We remove DeepFace from the *safest* fallback
+            # to guarantee it runs even if TF is broken.
+            
+            scored_scenes[scene_file] = priority_score
+
+        except Exception as e:
+            print(f"Error analyzing scene {scene_file} (Heuristics): {e}")
+            scored_scenes[scene_file] = 0.0
+        finally:
+            if cap:
+                cap.release()
+                
+    print(f"Heuristic analysis complete.")
     return scored_scenes
 
 
@@ -294,23 +373,26 @@ def get_scene_durations(scene_files: list) -> dict:
                 clip.close()
     return durations
 
-# --- "Mood Engine" Filter Functions (Unchanged) ---
+# --- "Mood Engine" Filter Functions ---
 MUSIC_DIR = "music"
 
 def apply_energetic_filter(clip):
-    clip = clip.fl(lambda gf, t: _boost_saturation(gf(t), 1.2))
-    effect = vfx.LumContrast(lum=0, contrast=1.5, contrast_thr=128) 
-    return clip.with_effects([effect])
+    # --- FIXED: Use clip.fl_image and clip.fx ---
+    clip = clip.fl_image(lambda frame: _boost_saturation(frame, 1.2))
+    clip = clip.fx(vfx.lum_contrast, lum=0, contrast=1.5, contrast_thr=128) 
+    return clip
 
 def apply_nostalgic_filter(clip):
-    return clip.fl(lambda gf, t: _apply_sepia_tint(gf(t)))
+    # --- FIXED: Use clip.fl_image ---
+    return clip.fl_image(_apply_sepia_tint)
 
 def apply_classic_filter(clip):
-    return vfx.BlackWhite(clip)
+    # --- FIXED: Use clip.fx ---
+    return clip.fx(vfx.blackwhite)
 
 def apply_cinematic_filter(clip):
-    effect = vfx.LumContrast(lum=0, contrast=1.5, contrast_thr=128)
-    return clip.with_effects([effect])
+    # --- FIXED: Use clip.fx ---
+    return clip.fx(vfx.lum_contrast, lum=0, contrast=1.5, contrast_thr=128)
 
 def apply_ambient_filter(clip):
     return clip
@@ -333,13 +415,14 @@ MUSIC_MAP = {
     "default": "default-music.mp3"
 }
 
-# --- Final Video Assembly Function (Unchanged) ---
+# --- Final Video Assembly Function ---
 def create_final_video(
     session_path: str,
     best_scenes_with_scores: list, 
     mood: str,
     event_type: str
 ) -> str:
+    import gc, time  # Added for cleanup safety
     
     print(f"Assembling final video for mood: {mood}, event: {event_type}")
     
@@ -348,82 +431,95 @@ def create_final_video(
     CROSSFADE_DURATION = mood_params["transition_duration"]
     
     music_file = MUSIC_MAP.get(event_type, MUSIC_MAP["default"])
-    
     music_path = os.path.join(MUSIC_DIR, music_file)
+    
     if not os.path.exists(music_path):
-        print(f"Warning: Music file '{music_file}' not found. Using default.")
+        print(f"⚠️ Warning: Music file '{music_file}' not found. Using default.")
         music_path = os.path.join(MUSIC_DIR, MUSIC_MAP["default"])
         if not os.path.exists(music_path):
-             raise FileNotFoundError(f"Default music file '{MUSIC_MAP['default']}' not found in 'music' folder.")
+            raise FileNotFoundError(f"Default music file '{MUSIC_MAP['default']}' not found in 'music' folder.")
     
     processed_clips = []
     
+    # --- Process each selected scene ---
     for file_path, score in best_scenes_with_scores:
         clip = None
         try:
             clip = VideoFileClip(file_path)
             clip = clip.without_audio()
 
-            if mood == "Cinematic" and score > 0.85:
-                print(f"Applying slow-mo to {os.path.basename(file_path)} (Score: {score:.2f})")
-                clip = vfx.MultiplySpeed(clip, 0.5) 
+            # Apply cinematic slow motion for high scores
+            is_high_ml_score = (score > 0.85 and score <= 1.0)
+            is_high_heuristic_score = (score > 200)
             
-            fade_in_effect = vfx.FadeIn(CROSSFADE_DURATION)
-            clip = clip.with_effects([fade_in_effect])
-            fade_out_effect = vfx.FadeOut(CROSSFADE_DURATION)
-            clip = clip.with_effects([fade_out_effect])
+            if mood == "Cinematic" and (is_high_ml_score or is_high_heuristic_score):
+                print(f"🎬 Applying slow-mo to {os.path.basename(file_path)} (Score: {score:.2f})")
+                clip = clip.fx(vfx.speedx, 0.5)
 
+            # Add transitions
+            clip = clip.fx(vfx.fadein, CROSSFADE_DURATION)
+            clip = clip.fx(vfx.fadeout, CROSSFADE_DURATION)
+
+            # Apply color/mood filters
             if filter_to_apply:
                 clip = filter_to_apply(clip)
             
             processed_clips.append(clip)
-            
+        
         except Exception as e:
-            print(f"Error processing clip {file_path}: {e}")
+            print(f"❌ Error processing clip {file_path}: {e}")
             if clip:
                 clip.close()
 
     if not processed_clips:
         raise ValueError("No clips were successfully processed.")
-
+    
+    # --- Concatenate the processed clips ---
     final_video = concatenate_videoclips(
         processed_clips, 
         padding=-CROSSFADE_DURATION, 
         method="compose"
     )
 
+    # --- Add background music ---
     audio_clip = None
     try:
         audio_clip = AudioFileClip(music_path)
-        final_video_duration = final_video.duration 
+        final_video_duration = final_video.duration
+        
         if final_video_duration > audio_clip.duration:
-             loop_effect = afx.AudioLoop(duration=final_video_duration)
-             audio_clip = audio_clip.with_effects([loop_effect])
+            audio_clip = audio_clip.fx(afx.audio_loop, duration=final_video_duration)
         else:
-            audio_clip = audio_clip.with_duration(final_video_duration)
-        fade_out_audio_effect = afx.AudioFadeOut(1.0)
-        audio_clip = audio_clip.with_effects([fade_out_audio_effect])
-        final_video = final_video.with_audio(audio_clip)
+            audio_clip = audio_clip.set_duration(final_video_duration)
+        
+        audio_clip = audio_clip.fx(afx.audio_fadeout, 1.0)
+        final_video = final_video.set_audio(audio_clip)
+    
     except Exception as e:
-        print(f"Error adding audio: {e}")
-
+        print(f"⚠️ Error adding audio: {e}")
+    
+    # --- Write the final video (fixed MoviePy 2.x syntax) ---
     output_filename = "VividReel_Final.mp4"
     output_path = os.path.join(session_path, output_filename)
     
-    print(f"Writing final video to: {output_path}")
+    print(f"📝 Writing final video to: {output_path}")
     final_video.write_videofile(
-        output_path, 
-        codec="libx264", 
-        audio_codec="aac",
-        temp_audiofile_path=session_path
+        output_path,
+        codec="libx264",
+        audio_codec="aac"
+        # ⚠️ Removed temp_audiofile_path (deprecated in MoviePy ≥2.0)
     )
     
-    print("Cleaning up resources...")
+    # --- Safe cleanup ---
+    print("🧹 Cleaning up resources...")
     if audio_clip:
         audio_clip.close()
     final_video.close()
     for clip in processed_clips:
         clip.close()
-        
-    print("Assembly complete.")
+    
+    gc.collect()
+    time.sleep(1)  # Prevent PermissionError on Windows file handles
+    
+    print("✅ Assembly complete.")
     return output_filename

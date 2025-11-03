@@ -46,25 +46,22 @@ def main(input_folder, mood, event_type):
         if not all_scene_files:
              raise Exception("No scenes were found or created.")
 
-        # --- NEW HYBRID LOGIC ---
+        # --- HYBRID LOGIC ---
         
         # Step 2: Try to score with VideoMAE Transformer
         print("--- Running Primary Model (VideoMAE) ---")
         scene_scores = analysis.predict_scene_scores_transformer(all_scene_files)
         
-        # Filter out scores below threshold (0)
         good_scenes_tuples = sorted(
             [item for item in scene_scores.items() if item[1] > 0], 
             key=lambda item: item[1], 
             reverse=True
         )
 
-        # Step 3: Check if VideoMAE failed (found too few clips)
+        # Step 3: Check if VideoMAE failed, fall back to RandomForest
         if len(good_scenes_tuples) < MINIMUM_SCENE_COUNT:
-            print(f"WARNING: VideoMAE found only {len(good_scenes_tuples)} clips.")
-            print("--- Falling Back to RandomForest Model ---")
+            print("--- Switching to RandomForest Model (11-feature) ---")
             
-            # Step 2 (Fallback): Score with RandomForest
             scene_scores = analysis.predict_scene_scores_randomforest(all_scene_files)
             
             good_scenes_tuples = sorted(
@@ -72,26 +69,48 @@ def main(input_folder, mood, event_type):
                 key=lambda item: item[1], 
                 reverse=True
             )
-            
-            if len(good_scenes_tuples) < MINIMUM_SCENE_COUNT:
-                 print("WARNING: Fallback model also found few clips. Proceeding anyway.")
 
-        sorted_scenes = good_scenes_tuples # This is now our list of (filepath, score)
+            # Step 3b: Check if RandomForest failed, fall back to Heuristics
+            if len(good_scenes_tuples) < MINIMUM_SCENE_COUNT:
+                print("--- Switching to Smart Heuristics Model (Safest) ---")
+                
+                scene_scores = analysis.predict_scene_scores_heuristics(all_scene_files)
+
+                good_scenes_tuples = sorted(
+                    [item for item in scene_scores.items() if item[1] > 0], 
+                    key=lambda item: item[1], 
+                    reverse=True
+                )
+
+                if len(good_scenes_tuples) < MINIMUM_SCENE_COUNT:
+                    print("WARNING: All models found few clips. Proceeding with best available.")
+
+        # --- THIS IS THE NEW LOGIC ---
+        # At this point, good_scenes_tuples is a list of good clips, sorted by SCORE.
+        # We now re-sort this list by FILENAME to restore chronological order.
+        print(f"Re-sorting {len(good_scenes_tuples)} good clips by name to maintain order...")
+        scenes_in_chronological_order = sorted(good_scenes_tuples, key=lambda item: item[0])
+        # --- END NEW LOGIC ---
         
         # --- END HYBRID LOGIC ---
 
         # Step 4: Limit by duration
-        good_scenes_to_check = [f for f, s in sorted_scenes]
+        # We get the filepaths from our NEW chronological list
+        good_scenes_to_check = [f for f, s in scenes_in_chronological_order]
         scene_durations = analysis.get_scene_durations(good_scenes_to_check)
         
         final_scene_list_paths = []
         current_duration = 0
         
-        for scene_file, score in sorted_scenes:
+        # We loop over the CHRONOLOGICAL list, not the score-sorted list
+        for scene_file, score in scenes_in_chronological_order:
             duration = scene_durations.get(scene_file, 0)
             
-            if mood == "Cinematic" and score > 0.85:
-                duration *= 2
+            is_high_ml_score = (score > 0.85 and score <= 1.0)
+            is_high_heuristic_score = (score > 200) 
+
+            if mood == "Cinematic" and (is_high_ml_score or is_high_heuristic_score):
+                duration *= 2 
 
             if duration > 0 and (current_duration + duration) <= TARGET_DURATION_SECONDS:
                 final_scene_list_paths.append((scene_file, score)) 
@@ -101,7 +120,7 @@ def main(input_folder, mood, event_type):
 
         if not final_scene_list_paths:
              raise Exception("No scenes fit within the target duration based on scores.")
-        print(f"Selected {len(final_scene_list_paths)} scenes totaling {current_duration:.2f} seconds.")
+        print(f"Selected {len(final_scene_list_paths)} scenes (in order) totaling {current_duration:.2f} seconds.")
 
         # Step 5: Assemble final video
         print("Assembling final video...")
